@@ -8,6 +8,16 @@
 #include <math.h>
 #include <arpa/inet.h>
 
+// Forward declaration of external structures and variables
+#define max_src 3000
+extern struct src_stat {
+    char* ip_string;
+    uint16_t packet_count;
+    uint16_t packet_volume;
+    uint16_t total_session;
+    uint16_t idle_session;
+} src_stats[max_src];
+
 // DBScan cluster labels
 #define NOISE -1
 #define UNCLASSIFIED -2
@@ -71,15 +81,29 @@ void dbscan_free_points(dbscan_points_t* points) {
     }
 }
 
-// Calculate distance between two IP addresses
-// This is a simple metric - you might want to use a more sophisticated one
+// Calculate distance between two points based on average packet size and total sessions
+// This is a more sophisticated metric that considers traffic behavior
 double ip_distance(uint32_t ip1, uint32_t ip2) {
-    // Convert to host byte order for arithmetic
-    uint32_t host_ip1 = ntohl(ip1);
-    uint32_t host_ip2 = ntohl(ip2);
-
-    // Simple distance metric: absolute difference between IPs
-    return (double)abs((int)(host_ip1 - host_ip2));
+    // Get indices for src_stats array
+    int idx1 = ip1 % max_src;
+    int idx2 = ip2 % max_src;
+    
+    // Calculate average packet size for each IP
+    double avg_pkt_size1 = (src_stats[idx1].packet_count > 0) ? 
+                          (double)src_stats[idx1].packet_volume / src_stats[idx1].packet_count : 0;
+    double avg_pkt_size2 = (src_stats[idx2].packet_count > 0) ? 
+                          (double)src_stats[idx2].packet_volume / src_stats[idx2].packet_count : 0;
+    
+    // Calculate normalized differences
+    double pkt_size_diff = fabs(avg_pkt_size1 - avg_pkt_size2);
+    double session_diff = fabs((double)src_stats[idx1].total_session - src_stats[idx2].total_session);
+    
+    // Weight factors (can be adjusted based on importance)
+    double w1 = 0.5; // weight for average packet size difference
+    double w2 = 0.5; // weight for total session difference
+    
+    // Combined distance metric
+    return w1 * pkt_size_diff + w2 * session_diff;
 }
 
 // Find all neighbors within eps distance
@@ -189,33 +213,68 @@ void dbscan_print_clusters(dbscan_points_t* points, int num_clusters) {
     for (int c = 0; c < num_clusters; c++) {
         printf("\nCluster %d:\n", c);
         int count = 0;
+        double total_avg_pkt_size = 0;
+        uint32_t total_sessions = 0;
 
         for (int i = 0; i < points->num_points; i++) {
             if (points->points[i].cluster_id == c) {
-                printf("  IP: %s, Packets: %u, Volume: %u\n",
+                int idx = points->points[i].ip % max_src;
+                double avg_pkt_size = (points->points[i].packet_count > 0) ? 
+                                    (double)points->points[i].packet_volume / points->points[i].packet_count : 0;
+                
+                printf("  IP: %s, Packets: %u, Volume: %u, Avg Size: %.2f, Sessions: %u\n",
                        points->points[i].ip_str,
                        points->points[i].packet_count,
-                       points->points[i].packet_volume);
+                       points->points[i].packet_volume,
+                       avg_pkt_size,
+                       src_stats[idx].total_session);
+                
+                total_avg_pkt_size += avg_pkt_size;
+                total_sessions += src_stats[idx].total_session;
                 count++;
             }
         }
-        printf("Total IPs in cluster: %d\n", count);
+        
+        if (count > 0) {
+            printf("Total IPs in cluster: %d\n", count);
+            printf("Cluster average packet size: %.2f\n", total_avg_pkt_size / count);
+            printf("Cluster average sessions: %.2f\n", (double)total_sessions / count);
+        }
     }
 
     // Print noise points
     printf("\nNoise points (not in any cluster):\n");
     int noise_count = 0;
+    double noise_total_avg_pkt_size = 0;
+    uint32_t noise_total_sessions = 0;
 
     for (int i = 0; i < points->num_points; i++) {
         if (points->points[i].cluster_id == NOISE) {
-            printf("  IP: %s, Packets: %u, Volume: %u\n",
+            int idx = points->points[i].ip % max_src;
+            double avg_pkt_size = (points->points[i].packet_count > 0) ? 
+                                (double)points->points[i].packet_volume / points->points[i].packet_count : 0;
+            
+            printf("  IP: %s, Packets: %u, Volume: %u, Avg Size: %.2f, Sessions: %u\n",
                    points->points[i].ip_str,
                    points->points[i].packet_count,
-                   points->points[i].packet_volume);
+                   points->points[i].packet_volume,
+                   avg_pkt_size,
+                   src_stats[idx].total_session);
+            
+            noise_total_avg_pkt_size += avg_pkt_size;
+            noise_total_sessions += src_stats[idx].total_session;
             noise_count++;
         }
     }
-    printf("Total noise points: %d\n", noise_count);
+    
+    if (noise_count > 0) {
+        printf("Total noise points: %d\n", noise_count);
+        printf("Noise average packet size: %.2f\n", noise_total_avg_pkt_size / noise_count);
+        printf("Noise average sessions: %.2f\n", (double)noise_total_sessions / noise_count);
+    } else {
+        printf("No noise points found\n");
+    }
+    
     printf("=====================================\n\n");
 }
 

@@ -1,4 +1,3 @@
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,7 +26,7 @@
 
 #include "DB_SCAN.h"
 // DBScan parameters
-#define DBSCAN_EPS 100000.0  // Epsilon value for DBScan (distance threshold)
+#define DBSCAN_EPS 50.0  // Epsilon value for DBScan (distance threshold)
 #define DBSCAN_MIN_PTS 3   
 
 #include <rte_common.h>
@@ -497,13 +496,13 @@ static void ndpi_idle_scan_walker(void const * const A, ndpi_VISIT which, int de
 #define window_size 10
 #define app_types 368
 
-struct src_stat{
-  char * ip_string;
-  uint16_t packet_count;
-  uint16_t packet_volume;
-  uint16_t total_session;
-  uint16_t idle_session;
-};
+// struct src_stat{
+//   char * ip_string;
+//   uint16_t packet_count;
+//   uint16_t packet_volume;
+//   uint16_t total_session;
+//   uint16_t idle_session;
+// };
 struct src_stat src_stats[max_src];
 
 typedef struct app_info{
@@ -563,6 +562,10 @@ double var(int arr[],int arr_size,double avg){
     res+= res+pow((arr[i]-avg),2);
   res/=(double)arr_size;
   return res;
+}
+
+int min(int a, int b) {
+    return (a < b) ? a : b;
 }
 
 void append(uint64_t arr[],int arr_size,uint64_t item){
@@ -1034,7 +1037,7 @@ static int lcore_main(__rte_unused void *dummy){
         int c = 0; // interval counter
         struct rte_ipv4_hdr *ipv4_hdr;
         struct rte_mbuf *pkt;
-        int p = 1; // training phases
+        int p = 5; // training phases
         bool training = true;      
         i=0;
         long long int number_of_packets_in_a_interval;

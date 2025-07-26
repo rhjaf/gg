@@ -34,7 +34,7 @@ CFLAGS += -g
 # nDPI
 LIBNDPI=/opt/nDPI/src/lib/libndpi.a
 LIBS=$(LIBNDPI) @PCAP_LIB@ @ADDITIONAL_LIBS@ @LIBS@ @GPROF_LIBS@
-HEADERS=reader_utils.h /opt/nDPI/src/include/ndpi_api.h /opt/nDPI/src/include/ndpi_typedefs.h /opt/nDPI/src/include/ndpi_protocol_ids.h 
+HEADERS=db_scan.h reader_utils.h /opt/nDPI/src/include/ndpi_api.h /opt/nDPI/src/include/ndpi_typedefs.h /opt/nDPI/src/include/ndpi_protocol_ids.h 
 CFLAGS += -fPIC -DPIC
 CFLAGS += -I/opt/nDPI/src/include  -lpcap 
 

@@ -25,7 +25,10 @@
 #include <sched.h>
 #endif
 
-
+#include "DB_SCAN.h"
+// DBScan parameters
+#define DBSCAN_EPS 100000.0  // Epsilon value for DBScan (distance threshold)
+#define DBSCAN_MIN_PTS 3   
 
 #include <rte_common.h>
 #include <rte_flow.h>
@@ -571,6 +574,45 @@ void append(uint64_t arr[],int arr_size,uint64_t item){
   res[arr_size-1] = item;
   memcpy(arr,res,sizeof(uint64_t)*arr_size);
   free(res);
+}
+
+
+// Function to perform DBScan clustering on source IPs for a specific application
+void perform_dbscan_clustering(int app_index) {
+    printf("\nPerforming DBScan clustering for application: %s\n", apps[app_index].app_name);
+
+    // Initialize points container
+    dbscan_points_t* points = dbscan_init_points(100);
+    if (!points) {
+        printf("Failed to initialize DBScan points container\n");
+        return;
+    }
+
+    // Collect all source IPs associated with this application
+    int count = 0;
+    for (int i = 0; i < max_src; i++) {
+        if (apps[app_index].source_count[i] > 0 && src_stats[i].ip_string != NULL) {
+            dbscan_add_point(points, i, src_stats[i].ip_string,
+                            src_stats[i].packet_count,
+                            src_stats[i].packet_volume);
+            count++;
+        }
+    }
+
+    printf("Collected %d source IPs for clustering\n", count);
+
+    if (count > 0) {
+        // Perform DBScan clustering
+        int num_clusters = dbscan_cluster(points, DBSCAN_EPS, DBSCAN_MIN_PTS);
+
+        // Print clustering results
+        dbscan_print_clusters(points, num_clusters);
+    } else {
+        printf("No source IPs to cluster\n");
+    }
+
+    // Free resources
+    dbscan_free_points(points);
 }
 
 
@@ -1131,6 +1173,10 @@ static int lcore_main(__rte_unused void *dummy){
                     if (((r_pred > r_u) && (apps[rh].interval_counter>apps[rh].max_counter) && (r_u!=0 && r_l!=0 && r_u!=r_l)) || ((r_pred < r_l) && (apps[rh].interval_counter < apps[rh].min_counter) && (r_u!=0 && r_l!=0 && r_u!=r_l)))
                     {        // alert DDoS detection
                             printf("A ddos attack has been occured! in Application : %s\n ",apps[rh].app_name);
+                            
+                            // Perform DBScan clustering on source IPs for this application
+                            // mitigation
+                            perform_dbscan_clustering(rh);
                     }
                     else {
                       append(apps[rh].ratio_window,window_size,r_pred);

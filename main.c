@@ -1,3 +1,4 @@
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,11 +25,13 @@
 #include <sched.h>
 #endif
 
+// DBScan
 #include "DB_SCAN.h"
 // DBScan parameters
-#define DBSCAN_EPS 50.0  // Epsilon value for DBScan (distance threshold)
-#define DBSCAN_MIN_PTS 3   
+#define DBSCAN_EPS 50.0  // Epsilon value for DBScan (distance threshold) - adjusted for new metric
+#define DBSCAN_MIN_PTS 3
 
+// DPDK
 #include <rte_common.h>
 #include <rte_flow.h>
 #include <rte_log.h>
@@ -51,17 +54,17 @@
 #include <rte_mbuf.h>
 #include <rte_flow.h>
 
-
-#include <ndpi_main.h> // nDPI module
+// nDPI
+#include <ndpi_main.h>
 #include <ndpi_typedefs.h>
 #include <ndpi_api.h>
 
 
-
+// DPDK parameters
 #define RTE_LOGTYPE_DDD RTE_LOGTYPE_USER1
 #define MAX_RX_QUEUE_PER_LCORE 1 // RX queues per lcore
-#define MAX_RX_QUEUE_PER_PORT 1
-#define MAX_TX_QUEUE_PER_PORT 1
+#define MAX_RX_QUEUE_PER_PORT 2
+#define MAX_TX_QUEUE_PER_PORT 2
 #define RX_DESC_DEFAULT 1024
 #define TX_DESC_DEFAULT 1024
 #define MBUF_CACHE_SIZE 256
@@ -73,6 +76,7 @@
 #define max_src 3000
 #define V_PRED 3
 #define R_PRED 3
+
 // ndpi definitions
 #define MAX_FLOW_ROOTS 200000 // max active flows for each workflow
 #define MAX_IDLE_FLOWS 64
@@ -496,29 +500,67 @@ static void ndpi_idle_scan_walker(void const * const A, ndpi_VISIT which, int de
 #define window_size 10
 #define app_types 368
 
-// struct src_stat{
-//   char * ip_string;
-//   uint16_t packet_count;
-//   uint16_t packet_volume;
-//   uint16_t total_session;
-//   uint16_t idle_session;
-// };
+/*
+struct src_stat{
+  char * ip_string;
+  uint16_t packet_count;
+  uint16_t packet_volume;
+  uint16_t total_session;
+  uint16_t idle_session;
+};
+*/
 struct src_stat src_stats[max_src];
 
 typedef struct app_info{
   char * app_name;
-  uint64_t max_counter; // initalize =0
-  uint64_t min_counter; // initalize =0
+  uint64_t max_counter; // initialize =0
+  uint64_t min_counter; // initialize =INT_MAX
   uint64_t counter_window[window_size];
   uint64_t interval_counter;
   uint64_t ratio_window[window_size];
   double ratio_pred;
   uint16_t new_session; // new session for this application
-  uint16_t source_count[max_src]; // Active Source IP entropy of each application 
+  uint16_t source_count[max_src]; // Active Source IP entropy of each application
+  
+  // D3 Algorithm inspired statistical data (based on IEEE paper 9424610)
+  uint32_t training_samples;      // Number of samples collected during training
+  double entropy_src_ip;          // Source IP entropy for this protocol
+  double entropy_dst_port;        // Destination port entropy for this protocol
+  double entropy_packet_size;     // Packet size entropy for this protocol
+  double traffic_rate;            // Current traffic rate (packets/second)
+  double baseline_entropy_src;    // Baseline source IP entropy during normal traffic
+  double baseline_entropy_dst;    // Baseline destination port entropy during normal traffic
+  double baseline_entropy_size;   // Baseline packet size entropy during normal traffic
+  double baseline_traffic_rate;   // Baseline traffic rate during normal traffic
+  double entropy_threshold;       // Dynamic threshold for entropy-based detection
+  double rate_threshold;          // Dynamic threshold for rate-based detection
+  double anomaly_score;           // Combined anomaly score
+  bool has_baseline;              // Whether this protocol has established a baseline
+  uint32_t packet_sizes[256];     // Histogram of packet sizes for entropy calculation
+  uint32_t dst_ports[65536];      // Histogram of destination ports for entropy calculation
+  uint32_t unique_src_ips;        // Count of unique source IPs in current interval
+  uint32_t total_packets;         // Total packets in current interval
 } app_info;
 
 app_info apps[app_types] = {
-  [0 ... app_types-1] = {.min_counter=INT_MAX}
+  [0 ... app_types-1] = {
+    .min_counter = INT_MAX,
+    .training_samples = 0,
+    .entropy_src_ip = 0,
+    .entropy_dst_port = 0,
+    .entropy_packet_size = 0,
+    .traffic_rate = 0,
+    .baseline_entropy_src = 0,
+    .baseline_entropy_dst = 0,
+    .baseline_entropy_size = 0,
+    .baseline_traffic_rate = 0,
+    .entropy_threshold = 0,
+    .rate_threshold = 0,
+    .anomaly_score = 0,
+    .has_baseline = false,
+    .unique_src_ips = 0,
+    .total_packets = 0
+  }
 };
 
 void clearScreen() {
@@ -548,6 +590,11 @@ double sum(int arr[],int arr_size){
   return res;
 }
 
+// Helper function to get the minimum of two integers
+int min(int a, int b) {
+    return (a < b) ? a : b;
+}
+
 double mean(int arr[],int arr_size){
   int res = 0;
   for(int i=0;i<arr_size;i++)
@@ -556,33 +603,192 @@ double mean(int arr[],int arr_size){
   return res;
 }
 
-double var(int arr[],int arr_size,double avg){
-  double res=0;
-  for(int i=0;i<arr_size;i++)
-    res+= res+pow((arr[i]-avg),2);
-  res/=(double)arr_size;
+double var(int arr[], int arr_size, double avg) {
+  double res = 0;
+  for(int i = 0; i < arr_size; i++)
+    res += pow((arr[i] - avg), 2);
+  res /= (double)arr_size;
   return res;
 }
 
-int min(int a, int b) {
-    return (a < b) ? a : b;
+
+// Calculate Shannon entropy for a histogram
+double calculate_entropy(uint32_t *histogram, int size, uint32_t total) {
+  if (total == 0) return 0.0;
+  
+  double entropy = 0.0;
+  for (int i = 0; i < size; i++) {
+    if (histogram[i] > 0) {
+      double probability = (double)histogram[i] / total;
+      entropy -= probability * log2(probability);
+    }
+  }
+  return entropy;
 }
 
-void append(uint64_t arr[],int arr_size,uint64_t item){
+// Calculate source IP entropy for an application
+double calculate_src_ip_entropy(app_info *app) {
+  uint32_t total_unique_ips = 0;
+  uint32_t ip_counts[max_src];
   
-  uint64_t *res = malloc(sizeof(uint64_t)*arr_size);
-  for(int i=0;i<arr_size-1;i++){
-    res[i] = arr[i+1];
+  // Count unique source IPs and their frequencies
+  for (int i = 0; i < max_src; i++) {
+    ip_counts[i] = app->source_count[i];
+    if (ip_counts[i] > 0) {
+      total_unique_ips++;
+    }
   }
-  res[arr_size-1] = item;
-  memcpy(arr,res,sizeof(uint64_t)*arr_size);
+  
+  if (total_unique_ips == 0) return 0.0;
+  
+  // Calculate entropy based on IP distribution
+  return calculate_entropy(ip_counts, max_src, app->total_packets);
+}
+
+// Calculate packet size entropy for an application
+double calculate_packet_size_entropy(app_info *app) {
+  return calculate_entropy(app->packet_sizes, 256, app->total_packets);
+}
+
+// Calculate destination port entropy for an application
+double calculate_dst_port_entropy(app_info *app) {
+  return calculate_entropy(app->dst_ports, 65536, app->total_packets);
+}
+
+// Update packet size histogram
+void update_packet_size_histogram(app_info *app, uint16_t packet_size) {
+  // Normalize packet size to 0-255 range for histogram
+  uint8_t size_bucket = (packet_size > 1500) ? 255 : (packet_size * 255 / 1500);
+  app->packet_sizes[size_bucket]++;
+}
+
+// Update destination port histogram
+void update_dst_port_histogram(app_info *app, uint16_t dst_port) {
+  app->dst_ports[dst_port]++;
+}
+
+// D3 Algorithm: Establish baseline during training phase
+void establish_baseline(app_info *app) {
+  if (app->training_samples < 10) return; // Need minimum samples
+  
+  // Calculate current entropy values
+  app->entropy_src_ip = calculate_src_ip_entropy(app);
+  app->entropy_dst_port = calculate_dst_port_entropy(app);
+  app->entropy_packet_size = calculate_packet_size_entropy(app);
+  app->traffic_rate = (double)app->total_packets; // packets per interval
+  
+  // Update baseline values (running average)
+  double alpha = 0.1; // Learning rate
+  if (app->baseline_entropy_src == 0) {
+    // First time initialization
+    app->baseline_entropy_src = app->entropy_src_ip;
+    app->baseline_entropy_dst = app->entropy_dst_port;
+    app->baseline_entropy_size = app->entropy_packet_size;
+    app->baseline_traffic_rate = app->traffic_rate;
+  } else {
+    // Update with exponential moving average
+    // NOTICE: Should we remove it?
+    app->baseline_entropy_src = (1 - alpha) * app->baseline_entropy_src + alpha * app->entropy_src_ip;
+    app->baseline_entropy_dst = (1 - alpha) * app->baseline_entropy_dst + alpha * app->entropy_dst_port;
+    app->baseline_entropy_size = (1 - alpha) * app->baseline_entropy_size + alpha * app->entropy_packet_size;
+    app->baseline_traffic_rate = (1 - alpha) * app->baseline_traffic_rate + alpha * app->traffic_rate;
+  }
+  
+  // NOTICE 
+  // Calculate dynamic thresholds based on baseline
+  // Lower entropy indicates potential DDoS (concentrated sources/ports)
+  app->entropy_threshold = app->baseline_entropy_src * 0.7; // 30% reduction threshold
+  app->rate_threshold = app->baseline_traffic_rate * 2.0;   // 100% increase threshold
+  
+  // Mark as having baseline after sufficient training
+  if (app->training_samples >= 20) {
+    app->has_baseline = true;
+  }
+}
+
+// D3 Algorithm: Calculate anomaly score based on entropy and traffic rate
+double calculate_anomaly_score(app_info *app) {
+  if (!app->has_baseline) return 0.0;
+  
+  // Calculate current entropy values
+  app->entropy_src_ip = calculate_src_ip_entropy(app);
+  app->entropy_dst_port = calculate_dst_port_entropy(app);
+  app->entropy_packet_size = calculate_packet_size_entropy(app);
+  app->traffic_rate = (double)app->total_packets;
+  
+  // Calculate entropy deviation (lower entropy = higher anomaly)
+  double entropy_deviation = 0.0;
+  if (app->baseline_entropy_src > 0) {
+    entropy_deviation += fmax(0, (app->baseline_entropy_src - app->entropy_src_ip) / app->baseline_entropy_src);
+  }
+  if (app->baseline_entropy_dst > 0) {
+    entropy_deviation += fmax(0, (app->baseline_entropy_dst - app->entropy_dst_port) / app->baseline_entropy_dst);
+  }
+  
+  // Calculate traffic rate deviation (higher rate = higher anomaly)
+  double rate_deviation = 0.0;
+  if (app->baseline_traffic_rate > 0) {
+    rate_deviation = fmax(0, (app->traffic_rate - app->baseline_traffic_rate) / app->baseline_traffic_rate);
+  }
+  
+  // Combined anomaly score (weighted combination)
+  double entropy_weight = 0.6;
+  double rate_weight = 0.4;
+  // Notice
+  // Good Score
+  app->anomaly_score = entropy_weight * entropy_deviation + rate_weight * rate_deviation;
+  
+  return app->anomaly_score;
+}
+
+// D3 Algorithm: DDoS detection based on statistical anomaly
+bool detect_ddos_attack(app_info *app) {
+  if (!app->has_baseline) return false;
+  
+  double anomaly_score = calculate_anomaly_score(app);
+  
+  // Detection criteria based on D3 algorithm
+  bool entropy_anomaly = (app->entropy_src_ip < app->entropy_threshold);
+  bool rate_anomaly = (app->traffic_rate > app->rate_threshold);
+  bool combined_anomaly = (anomaly_score > 0.5); // Threshold for combined score
+  
+  // DDoS detected if multiple conditions are met
+  return (entropy_anomaly && rate_anomaly) || combined_anomaly;
+}
+
+// Reset interval statistics for next measurement
+void reset_interval_stats(app_info *app) {
+  // Clear histograms
+  memset(app->packet_sizes, 0, sizeof(app->packet_sizes));
+  memset(app->dst_ports, 0, sizeof(app->dst_ports));
+  
+  // Reset counters
+  app->unique_src_ips = 0;
+  app->total_packets = 0;
+  app->interval_counter = 0;
+  app->new_session = 0;
+  
+  // Clear source count for next interval
+  memset(app->source_count, 0, sizeof(app->source_count));
+}
+
+void append(uint64_t arr[], int arr_size, uint64_t item) {
+  // Notice. What is actually adding
+  uint64_t *res = malloc(sizeof(uint64_t) * arr_size);
+  for(int i = 0; i < arr_size - 1; i++) {
+    res[i] = arr[i + 1];
+  }
+  res[arr_size - 1] = item;
+  memcpy(arr, res, sizeof(uint64_t) * arr_size);
   free(res);
 }
 
 
 // Function to perform DBScan clustering on source IPs for a specific application
 void perform_dbscan_clustering(int app_index) {
-    printf("\nPerforming DBScan clustering for application: %s\n", apps[app_index].app_name);
+    printf("\n===== Performing DBScan clustering for application: %s =====\n", apps[app_index].app_name);
+    printf("Using new distance metric based on average packet size and total sessions\n");
+    printf("Epsilon: %.2f, MinPoints: %d\n", DBSCAN_EPS, DBSCAN_MIN_PTS);
 
     // Initialize points container
     dbscan_points_t* points = dbscan_init_points(100);
@@ -598,6 +804,9 @@ void perform_dbscan_clustering(int app_index) {
             dbscan_add_point(points, i, src_stats[i].ip_string,
                             src_stats[i].packet_count,
                             src_stats[i].packet_volume);
+                            // NOTICE
+                            // src_stats[i].total_session
+                          
             count++;
         }
     }
@@ -605,17 +814,73 @@ void perform_dbscan_clustering(int app_index) {
     printf("Collected %d source IPs for clustering\n", count);
 
     if (count > 0) {
+        // Print some sample distances to understand the new metric
+        if (count >= 2) {
+            printf("\nSample distances between points using new metric:\n");
+            for (int i = 0; i < min(5, count); i++) {
+                for (int j = i+1; j < min(5, count); j++) {
+                    uint32_t ip1 = points->points[i].ip;
+                    uint32_t ip2 = points->points[j].ip;
+                    double distance = ip_distance(ip1, ip2);
+                    
+                    // Calculate the components for explanation
+                    int idx1 = ip1 % max_src;
+                    int idx2 = ip2 % max_src;
+                    double avg_pkt_size1 = (src_stats[idx1].packet_count > 0) ? 
+                                         (double)src_stats[idx1].packet_volume / src_stats[idx1].packet_count : 0;
+                    double avg_pkt_size2 = (src_stats[idx2].packet_count > 0) ? 
+                                         (double)src_stats[idx2].packet_volume / src_stats[idx2].packet_count : 0;
+                    
+                    printf("Distance between %s and %s: %.2f\n", 
+                           points->points[i].ip_str, points->points[j].ip_str, distance);
+                    printf("  IP1: Avg Pkt Size=%.2f, Sessions=%u\n", 
+                           avg_pkt_size1, src_stats[idx1].total_session);
+                    printf("  IP2: Avg Pkt Size=%.2f, Sessions=%u\n", 
+                           avg_pkt_size2, src_stats[idx2].total_session);
+                }
+            }
+            printf("\n");
+        }
+
         // Perform DBScan clustering
         int num_clusters = dbscan_cluster(points, DBSCAN_EPS, DBSCAN_MIN_PTS);
 
         // Print clustering results
         dbscan_print_clusters(points, num_clusters);
+        
+        // Print additional statistics about clusters
+        if (num_clusters > 0) {
+            printf("\nCluster Statistics:\n");
+            for (int c = 0; c < num_clusters; c++) {
+                double total_avg_pkt_size = 0;
+                double total_sessions = 0;
+                int cluster_size = 0;
+                
+                for (int i = 0; i < points->num_points; i++) {
+                    if (points->points[i].cluster_id == c) {
+                        int idx = points->points[i].ip % max_src;
+                        double avg_pkt_size = (src_stats[idx].packet_count > 0) ? 
+                                            (double)src_stats[idx].packet_volume / src_stats[idx].packet_count : 0;
+                        total_avg_pkt_size += avg_pkt_size;
+                        total_sessions += src_stats[idx].total_session;
+                        cluster_size++;
+                    }
+                }
+                
+                if (cluster_size > 0) {
+                    printf("Cluster %d:\n", c);
+                    printf("  Average packet size: %.2f\n", total_avg_pkt_size / cluster_size);
+                    printf("  Average sessions: %.2f\n", total_sessions / cluster_size);
+                }
+            }
+        }
     } else {
         printf("No source IPs to cluster\n");
     }
 
     // Free resources
     dbscan_free_points(points);
+    printf("=================================================================\n");
 }
 
 
@@ -630,17 +895,19 @@ static void check_for_idle_flows(struct nDPI_workflow * const workflow)
 	      struct nDPI_flow_info * const f = (struct nDPI_flow_info *)workflow->ndpi_flows_idle[--workflow->cur_idle_flows];
 	      src_stats[f->ip_tuple.v4.src%max_src].idle_session +=1;
         apps[f->detected_l7_protocol.app_protocol].source_count[f->ip_tuple.v4.src%max_src]--;
-        if (f->flow_fin_ack_seen == 1) {
+        
+        // if (f->flow_fin_ack_seen == 1) {
           // remove_comment
         /*
 	        printf("Free fin flow with id %u\n", f->flow_id);
           */
-	      } else {
+	      // } else {
           // remove_comment
         /*
 	        printf("Free idle flow with id %u\n", f->flow_id);
           */
-	      }
+	      // }
+  
 	      ndpi_tdelete(f, &workflow->ndpi_flows_active[idle_scan_index], ndpi_workflow_node_cmp);
         
 	      ndpi_flow_info_freer(f);
@@ -943,19 +1210,17 @@ static void ndpi_process_packet(struct ndpi_thread *nDPI_thread, struct pcap_pkt
     flow_to_process->guessed_protocol = ndpi_detection_giveup(workflow->ndpi_struct, flow_to_process->ndpi_flow, 1, &protocol_was_guessed);
     if (protocol_was_guessed != 0) {
       // remove_comment
-      /*
+
       printf("[%8llu, %4d][GUESSED] protocol: %s | app protocol: %s | category: %s\n", 
       workflow->packets_captured,flow_to_process->flow_id,
       ndpi_get_proto_name(workflow->ndpi_struct, flow_to_process->guessed_protocol.master_protocol),
       ndpi_get_proto_name(workflow->ndpi_struct, flow_to_process->guessed_protocol.app_protocol),
       ndpi_category_get_name(workflow->ndpi_struct, flow_to_process->guessed_protocol.category));
-      */
     } else {
       // remove_comment
-      /*
+      
       printf("[%8llu, %4d][FLOW NOT CLASSIFIED]\n",
 	     workflow->packets_captured, flow_to_process->flow_id);
-       */
     }
   }
 
@@ -969,7 +1234,7 @@ static void ndpi_process_packet(struct ndpi_thread *nDPI_thread, struct pcap_pkt
         flow_to_process->detection_completed = 1;
         workflow->detected_flow_protocols++;
         // remove_comment
-        /*
+        
         printf("[%8llu, %4d][DETECTED] protocol: %s | app protocol: %s | category: %s | app_protocol_num: %d\n" ,
 	       workflow->packets_captured, flow_to_process->flow_id,
 	       ndpi_get_proto_name(workflow->ndpi_struct, flow_to_process->detected_l7_protocol.master_protocol),
@@ -977,17 +1242,37 @@ static void ndpi_process_packet(struct ndpi_thread *nDPI_thread, struct pcap_pkt
 	       ndpi_category_get_name(workflow->ndpi_struct, flow_to_process->detected_l7_protocol.category),
          flow_to_process->detected_l7_protocol.app_protocol
          );
-        */
-         apps[flow_to_process->detected_l7_protocol.app_protocol].interval_counter+=pkt_len;
-         apps[flow_to_process->detected_l7_protocol.app_protocol].source_count[flow_to_process->ip_tuple.v4.src%max_src]++;
-         apps[flow_to_process->detected_l7_protocol.app_protocol].app_name = strdup(ndpi_get_proto_name(workflow->ndpi_struct, flow_to_process->detected_l7_protocol.app_protocol));
-         if(new_flow)
-          apps[flow_to_process->detected_l7_protocol.app_protocol].new_session+=1;
-         /*
+        
+         // Update D3 algorithm statistics
+         int app_idx = flow_to_process->detected_l7_protocol.app_protocol;
+         apps[app_idx].interval_counter += pkt_len;
+         apps[app_idx].source_count[flow_to_process->ip_tuple.v4.src % max_src]++;
+         apps[app_idx].app_name = strdup(ndpi_get_proto_name(workflow->ndpi_struct, flow_to_process->detected_l7_protocol.app_protocol));
+         
+         // Update D3 algorithm specific statistics
+         apps[app_idx].total_packets++;
+         update_packet_size_histogram(&apps[app_idx], pkt_len);
+         update_dst_port_histogram(&apps[app_idx], flow_to_process->dst_port);
+         
+         if(new_flow) {
+           apps[app_idx].new_session += 1;
+           // Count unique source IPs
+           bool is_new_src = true;
+           for(int i = 0; i < max_src; i++) {
+             if(apps[app_idx].source_count[i] > 0 && i == (flow_to_process->ip_tuple.v4.src % max_src)) {
+               if(apps[app_idx].source_count[i] == 1) {
+                 apps[app_idx].unique_src_ips++;
+               }
+               break;
+             }
+           }
+         }
+        
+         // NOTICE
          printf("app_types : %d",flow_to_process->detected_l7_protocol.master_protocol);
          printf("\tv_max = %" PRIu64 " v_min = %" PRIu64" ",apps[flow_to_process->detected_l7_protocol.master_protocol].max_counter,apps[flow_to_process->detected_l7_protocol.master_protocol].min_counter);
          printf(" interval_counter = %" PRIu64 " ratio_pred = %" PRIu64"\n",apps[flow_to_process->detected_l7_protocol.master_protocol].interval_counter,apps[flow_to_process->detected_l7_protocol.master_protocol].ratio_pred);
-        */
+        
       }
     }
 
@@ -1002,6 +1287,242 @@ static void ndpi_process_packet(struct ndpi_thread *nDPI_thread, struct pcap_pkt
 }
 
 
+// Threshold Export/ Import
+#define DEFAULT_THRESHOLD_FILE "/tmp/d3_thresholds.dat"
+
+// Threshold record structure for file storage
+typedef struct threshold_record {
+    char app_name[64];                // Protocol name
+    uint32_t training_samples;        // Number of samples used for training
+    double baseline_entropy_src;      // Baseline source IP entropy
+    double baseline_entropy_dst;      // Baseline destination port entropy
+    double baseline_entropy_size;     // Baseline packet size entropy
+    double baseline_traffic_rate;     // Baseline traffic rate
+    double entropy_threshold;         // Entropy threshold for detection
+    double rate_threshold;            // Rate threshold for detection
+} threshold_record_t;
+
+bool save_thresholds(const char *filename, app_info *apps, int app_count) {
+    FILE *fp = fopen(filename, "w");
+    if (!fp) {
+        printf("Error: Could not open threshold file %s for writing\n", filename);
+        return false;
+    }
+    
+    int saved_count = 0;
+    time_t now = time(NULL);
+    
+    // Write file header with metadata
+    fprintf(fp, "# D3 Algorithm Threshold File\n");
+    fprintf(fp, "# Generated on: %s", ctime(&now));
+    fprintf(fp, "# Format: protocol_name training_samples baseline_entropy_src baseline_entropy_dst baseline_entropy_size baseline_traffic_rate entropy_threshold rate_threshold\n");
+    fprintf(fp, "# Version: 1.0\n");
+    fprintf(fp, "\n");
+    
+    // Count valid protocols first
+    int valid_count = 0;
+    for (int i = 0; i < app_count; i++) {
+        if (apps[i].app_name != NULL && apps[i].has_baseline) {
+            valid_count++;
+        }
+    }
+    
+    fprintf(fp, "PROTOCOL_COUNT=%d\n\n", valid_count);
+    
+    // Write each protocol's thresholds in readable format
+    for (int i = 0; i < app_count; i++) {
+        if (apps[i].app_name == NULL || !apps[i].has_baseline) {
+            continue;
+        }
+        
+        // fprintf(fp, "# Protocol: %s\n", apps[i].app_name);
+        fprintf(fp, "PROTOCOL=%s\n", apps[i].app_name);
+        fprintf(fp, "TRAINING_SAMPLES=%u\n", apps[i].training_samples);
+        fprintf(fp, "BASELINE_ENTROPY_SRC=%.6f\n", apps[i].baseline_entropy_src);
+        fprintf(fp, "BASELINE_ENTROPY_DST=%.6f\n", apps[i].baseline_entropy_dst);
+        fprintf(fp, "BASELINE_ENTROPY_SIZE=%.6f\n", apps[i].baseline_entropy_size);
+        fprintf(fp, "BASELINE_TRAFFIC_RATE=%.6f\n", apps[i].baseline_traffic_rate);
+        fprintf(fp, "ENTROPY_THRESHOLD=%.6f\n", apps[i].entropy_threshold);
+        fprintf(fp, "RATE_THRESHOLD=%.6f\n", apps[i].rate_threshold);
+        fprintf(fp, "\n");
+        
+        saved_count++;
+    }
+    
+    fclose(fp);
+    printf("Successfully saved thresholds for %d protocols to %s\n", saved_count, filename);
+    printf("Threshold file is now human-readable and can be edited manually\n");
+    return true;
+}
+
+/*
+ * Load protocol thresholds from a human-readable text file
+ * 
+ * @param filename: Path to the threshold file
+ * @param apps: Array of app_info structures to populate
+ * @param app_count: Number of applications
+ * @return: true if successful, false otherwise
+ */
+bool load_thresholds(const char *filename, app_info *apps, int app_count) {
+    FILE *fp = fopen(filename, "r");
+    if (!fp) {
+        printf("Error: Could not open threshold file %s for reading\n", filename);
+        return false;
+    }
+    
+    char line[256];
+    int protocol_count = 0;
+    int loaded_count = 0;
+    char current_protocol[64] = "";
+    
+    // Temporary variables for current protocol being loaded
+    uint32_t training_samples = 0;
+    double baseline_entropy_src = 0.0;
+    double baseline_entropy_dst = 0.0;
+    double baseline_entropy_size = 0.0;
+    double baseline_traffic_rate = 0.0;
+    double entropy_threshold = 0.0;
+    double rate_threshold = 0.0;
+    bool protocol_data_complete = false;
+    
+    printf("Loading thresholds from %s\n", filename);
+    
+    // Read file line by line
+    while (fgets(line, sizeof(line), fp)) {
+        // Skip comments and empty lines
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') {
+            continue;
+        }
+        
+        // Remove trailing newline
+        // line[strcspn(line, "\n\r")] = 0;
+        
+        // Parse protocol count
+        if (sscanf(line, "PROTOCOL_COUNT=%d", &protocol_count) == 1) {
+            printf("Expected to load %d protocols\n", protocol_count);
+            continue;
+        }
+        
+        // Parse protocol name
+        if (sscanf(line, "PROTOCOL=%63s", current_protocol) == 1) {
+            protocol_data_complete = false;
+            continue;
+        }
+        
+        // Parse training samples
+        if (sscanf(line, "TRAINING_SAMPLES=%u", &training_samples) == 1) {
+            continue;
+        }
+        
+        // Parse baseline entropy values
+        if (sscanf(line, "BASELINE_ENTROPY_SRC=%lf", &baseline_entropy_src) == 1) {
+            continue;
+        }
+        if (sscanf(line, "BASELINE_ENTROPY_DST=%lf", &baseline_entropy_dst) == 1) {
+            continue;
+        }
+        if (sscanf(line, "BASELINE_ENTROPY_SIZE=%lf", &baseline_entropy_size) == 1) {
+            continue;
+        }
+        
+        // Parse baseline traffic rate
+        if (sscanf(line, "BASELINE_TRAFFIC_RATE=%lf", &baseline_traffic_rate) == 1) {
+            continue;
+        }
+        
+        // Parse thresholds
+        if (sscanf(line, "ENTROPY_THRESHOLD=%lf", &entropy_threshold) == 1) {
+            continue;
+        }
+        if (sscanf(line, "RATE_THRESHOLD=%lf", &rate_threshold) == 1) {
+            protocol_data_complete = true;
+            
+            // All data for current protocol is loaded, find matching app and update
+            bool found = false;
+            for (int j = 0; j < app_count; j++) {
+                if (apps[j].app_name != NULL && strcmp(apps[j].app_name, current_protocol) == 0) {
+                    // Found matching protocol, load thresholds
+                    apps[j].training_samples = training_samples;
+                    apps[j].baseline_entropy_src = baseline_entropy_src;
+                    apps[j].baseline_entropy_dst = baseline_entropy_dst;
+                    apps[j].baseline_entropy_size = baseline_entropy_size;
+                    apps[j].baseline_traffic_rate = baseline_traffic_rate;
+                    apps[j].entropy_threshold = entropy_threshold;
+                    apps[j].rate_threshold = rate_threshold;
+                    apps[j].has_baseline = true;
+                    
+                    printf("  Loaded thresholds for protocol: %s\n", current_protocol);
+                    printf("    Training samples: %u\n", training_samples);
+                    printf("    Baseline entropy - src: %.3f, dst: %.3f, size: %.3f\n",
+                           baseline_entropy_src, baseline_entropy_dst, baseline_entropy_size);
+                    printf("    Baseline traffic rate: %.2f\n", baseline_traffic_rate);
+                    printf("    Thresholds - entropy: %.3f, rate: %.2f\n",
+                           entropy_threshold, rate_threshold);
+                    
+                    loaded_count++;
+                    found = true;
+                    break;
+                }
+            }
+            
+            if (!found) {
+                printf("  Warning: Protocol %s from threshold file not found in current configuration\n", 
+                       current_protocol);
+            }
+            
+            // Reset for next protocol
+            memset(current_protocol, 0, sizeof(current_protocol));
+            continue;
+        }
+    }
+    
+    fclose(fp);
+    printf("Successfully loaded thresholds for %d protocols\n", loaded_count);
+    return loaded_count > 0;
+}
+
+/*
+ * Print the current thresholds for all protocols with baselines
+ * 
+ * @param apps: Array of app_info structures
+ * @param app_count: Number of applications
+ */
+void print_thresholds(app_info *apps, int app_count) {
+    printf("\n=== Current Protocol Thresholds ===\n");
+    int count = 0;
+    
+    for (int i = 0; i < app_count; i++) {
+        if (apps[i].app_name != NULL && apps[i].has_baseline) {
+            printf("Protocol: %s\n", apps[i].app_name);
+            printf("  Baseline entropy - src: %.3f, dst: %.3f, size: %.3f\n",
+                   apps[i].baseline_entropy_src, apps[i].baseline_entropy_dst, 
+                   apps[i].baseline_entropy_size);
+            printf("  Baseline traffic rate: %.2f packets/interval\n", 
+                   apps[i].baseline_traffic_rate);
+            printf("  Detection thresholds - entropy: %.3f, rate: %.2f\n",
+                   apps[i].entropy_threshold, apps[i].rate_threshold);
+            printf("  Training samples: %d\n", apps[i].training_samples);
+            count++;
+        }
+    }
+    
+    if (count == 0) {
+        printf("No protocols with established baselines found\n");
+    }
+    
+    printf("=== Total: %d protocols ===\n\n", count);
+}
+
+
+
+bool skip_training = false;           // Skip training phase and load thresholds
+bool save_thresholds_after_training = false;  // Save thresholds after training
+char threshold_file[256] = DEFAULT_THRESHOLD_FILE;
+
+
+
+
+
 /*
  * The lcore main. This is the main thread that does the work, reading from
  * an input port, and do processing on the metrics.
@@ -1009,220 +1530,368 @@ static void ndpi_process_packet(struct ndpi_thread *nDPI_thread, struct pcap_pkt
 static int lcore_main(__rte_unused void *dummy){  
   struct rte_mbuf *pkts_burst[MAX_PKT_BURST];
   struct rte_mbuf *m;
-  unsigned int i,j, port, lcore_id, nb_rx, nb_tx;
+  unsigned int i, j, port, lcore_id, nb_rx, nb_tx;
   struct lcore_queue_conf *qconf;
-  double r_u=INT_MAX;
-  double r_l=INT_MAX;
-  double r_pred;
-  uint64_t v_pred;
-  double avg,sd;
   lcore_id = rte_lcore_id();
   qconf = &lcore_queue_conf[lcore_id];
 
   if (qconf->n_rx_port == 0) {
-		RTE_LOG(INFO, DDD, "lcore %u has nothing to do\n", lcore_id);
-		return 0;
-	}
+    RTE_LOG(INFO, DDD, "lcore %u has nothing to do\n", lcore_id);
+    return 0;
+  }
 
-	RTE_LOG(INFO, DDD, "entering main loop on lcore %u\n", lcore_id);
+  RTE_LOG(INFO, DDD, "entering main loop on lcore %u\n", lcore_id);
 
-	for (i = 0; i < qconf->n_rx_port; i++) {
-		port = qconf->rx_port_list[i];
-		RTE_LOG(INFO, DDD, " -- lcoreid=%u portid=%u\n", lcore_id, port);
-
-	}
+  for (i = 0; i < qconf->n_rx_port; i++) {
+    port = qconf->rx_port_list[i];
+    RTE_LOG(INFO, DDD, " -- lcoreid=%u portid=%u\n", lcore_id, port);
+  }
+  
   ndpi_threads[lcore_id].workflow = init_workflow();
-        clock_t start_time, end_time;
-        double time_elapsed;
-        int c = 0; // interval counter
-        struct rte_ipv4_hdr *ipv4_hdr;
-        struct rte_mbuf *pkt;
-        int p = 5; // training phases
-        bool training = true;      
-        i=0;
-        long long int number_of_packets_in_a_interval;
-        clock_t interval_len = CLOCKS_PER_SEC;
+  
+  // D3 Algorithm variables
+  clock_t start_time, end_time;
+  int c = 0; // interval counter
+  struct rte_mbuf *pkt;
+  i = 0;
+  long long int number_of_packets_in_a_interval;
+  clock_t interval_len = CLOCKS_PER_SEC;
+  
+  // Training configuration for D3 algorithm
+  int min_training_intervals = 30;  // Minimum intervals for baseline establishment
+  int max_training_intervals = 60;  // Maximum training intervals
+  bool training = !skip_training;   // Skip training if thresholds are loaded
+  
+  printf("=== D3 Algorithm Inspired DDoS Detection System ===\n");
+  printf("Based on IEEE paper 9424610: Statistical Anomaly Detection\n");
+  
+  // Load thresholds if in detection-only mode
+  if (skip_training) {
+    printf("Detection-only mode: Loading thresholds from %s\n", threshold_file);
+    print_thresholds(apps, app_types);
+    if (load_thresholds(threshold_file, apps, app_types)) {
+      printf("Successfully loaded thresholds, skipping training phase\n");
+      print_thresholds(apps, app_types);
+    } else {
+      printf("Failed to load thresholds, reverting to training mode\n");
+      training = true;
+    }
+  }
+  
+  if (training) {
+    printf("Training phase: %d-%d intervals per protocol\n", min_training_intervals, max_training_intervals);
+  }
+  
+  printf("Detection features: Source IP entropy, Destination port entropy, Packet size entropy, Traffic rate\n\n");
 
-        while(!force_quit){        
-                start_time = clock();
-                end_time = clock();
-                number_of_packets_in_a_interval = 0;
-                // training
-                while(!(c/window_size==p) && training){
-                        start_time = clock();
-                        end_time = clock();
-                        while((((end_time - start_time) / interval_len)<1) && (!force_quit)){
-                                // recieving packets
-                                for (i = 0; i < qconf->n_rx_port; i++) {
-                                        port = qconf->rx_port_list[i];
-                                        nb_rx = rte_eth_rx_burst(port, 0, pkts_burst, MAX_PKT_BURST);
-                                        if (unlikely(nb_rx == 0))
-                                                continue;
-                                        port_statistics[port].rx += nb_rx;
-                                        // processing packets
-                                        for (j = 0; j < nb_rx; j++) {
-                                                pkt = pkts_burst[j];
-                                                uint16_t packetLength = rte_pktmbuf_pkt_len(pkt);
-                                                uint16_t payloadLength = packetLength - pkt->l2_len - pkt->l3_len - pkt->l4_len;
-                                                uint32_t pkt_len = pkt->pkt_len;
-                                                char *data = rte_pktmbuf_mtod(pkt, char *);
-                                                int len = rte_pktmbuf_pkt_len(pkt);
-                                                struct pcap_pkthdr h;
-                                                h.len = h.caplen = len;
-                                                gettimeofday(&h.ts, NULL);
-                                                ndpi_process_packet(&ndpi_threads[lcore_id],&h, (const u_char *)data,pkt_len+payloadLength);
-                                        }
-                                        // sending packets back
-                                        nb_tx = rte_eth_tx_burst(port ^ 1, 0, pkts_burst, nb_rx);
-			                                  /* Free any unsent packets. */
-                                        if (unlikely(nb_tx < nb_rx)) {
-                                          uint16_t buf;
-                                          for (buf = nb_tx; buf < nb_rx; buf++)
-                                            rte_pktmbuf_free(pkts_burst[buf]);
-                                        }
-                                        number_of_packets_in_a_interval += nb_rx;
-                                }
-                                end_time = clock();
-                        }
-                    
-                        // a time interval passed    
-                        clearScreen();
-                        // printf("Number of packets in %d time interval: %lld\n",c,number_of_packets_in_a_interval);
-                        for(int i=0;i<app_types;i++){
-                          if (apps[i].interval_counter > apps[i].max_counter)
-                            apps[i].max_counter = apps[i].interval_counter;
-                          else if((apps[i].interval_counter!=0) && (apps[i].interval_counter < apps[i].min_counter))
-                            apps[i].min_counter = apps[i].interval_counter;
-                          else if((apps[i].interval_counter==0) && (apps[i].max_counter!=0))
-                            apps[i].min_counter = 0;
-                          apps[i].interval_counter = 0;
-                          apps[i].new_session=0;
-                        }                        
-                        ++c;
-                        number_of_packets_in_a_interval = 0;
-                        
-                }
-                
-                if(training==true){
-                        // printf("#####\n#####\ntraining phase finished: \n");
-                        c = 0;
-                        training = false;
-                        start_time = clock();
-                        end_time = clock();
-                }                
-                // testing
-                
-                while(((end_time - start_time) / CLOCKS_PER_SEC)<1){
-                        // recieving packets
-                        for (i = 0; i < qconf->n_rx_port; i++) {
-                                port = qconf->rx_port_list[i];
-                                nb_rx = rte_eth_rx_burst(port, 0, pkts_burst, MAX_PKT_BURST);
-                                if (unlikely(nb_rx == 0))
-                                        continue;
-                                port_statistics[port].rx += nb_rx;
-                                // processing packets
-                                for (j = 0; j < nb_rx; j++) {
-                                        pkt = pkts_burst[j];
-                                        uint16_t packetLength = rte_pktmbuf_pkt_len(pkt);
-                                        uint16_t payloadLength = packetLength - pkt->l2_len - pkt->l3_len - pkt->l4_len;
-                                        uint32_t pkt_len = pkt->pkt_len;
-                                        char *data = rte_pktmbuf_mtod(pkt, char *);
-                                        int len = rte_pktmbuf_pkt_len(pkt);
-                                        struct pcap_pkthdr h;
-                                        h.len = h.caplen = len;
-                                        gettimeofday(&h.ts, NULL);
-                                        ndpi_process_packet(&ndpi_threads[lcore_id],&h, (const u_char *)data,pkt_len+payloadLength);
-                                }
-                                // sending packets back
-                                nb_tx = rte_eth_tx_burst(port ^ 1, 0, pkts_burst, nb_rx);
-			                          // Free any unsent packets. 
-			                          if (unlikely(nb_tx < nb_rx)) {
-				                        uint16_t buf;
-				                        for (buf = nb_tx; buf < nb_rx; buf++)
-				                                rte_pktmbuf_free(pkts_burst[buf]);
-			                          }
-                                number_of_packets_in_a_interval += nb_rx;
-                        }
-                        end_time = clock();
-                }
-                // a time interval passed
-                clearScreen();
-                // printf("Number of packets in %d time interval: %lld\n",c,number_of_packets_in_a_interval);
-                for(int rh=0;rh<app_types;rh++){
-                    uint64_t *tmp = malloc(sizeof(uint64_t)*window_size);
-                    memcpy(tmp,apps[rh].counter_window,window_size*sizeof(uint64_t));
-                    qsort(apps[rh].counter_window, window_size, sizeof(uint64_t), compare);
-                    v_pred = 0;
-                    r_pred = 0;
-                    for(int t=0;t<window_size;t++){
-                      if (apps[rh].counter_window[t]>0)
-                        v_pred += apps[rh].counter_window[t] * (double)(t+1); 
-                      else
-                        break;
-                    }
-                    v_pred/=(double)55;
-                    if(v_pred<=0)
-                      v_pred = V_PRED;
-                    r_pred = apps[rh].interval_counter / v_pred;
-                    if(r_pred<=0)
-                      r_pred = R_PRED;
-                    
-                    avg = mean(apps[rh].ratio_window,window_size);
-                    sd = sqrt(var(apps[rh].ratio_window,window_size,avg));
-                    r_u = avg + 3 * sd;
-                    r_l = avg - 3 * sd;
-                    
-                    
-                    if (((r_pred > r_u) && (apps[rh].interval_counter>apps[rh].max_counter) && (r_u!=0 && r_l!=0 && r_u!=r_l)) || ((r_pred < r_l) && (apps[rh].interval_counter < apps[rh].min_counter) && (r_u!=0 && r_l!=0 && r_u!=r_l)))
-                    {        // alert DDoS detection
-                            printf("A ddos attack has been occured! in Application : %s\n ",apps[rh].app_name);
-                            
-                            // Perform DBScan clustering on source IPs for this application
-                            // mitigation
-                            perform_dbscan_clustering(rh);
-                    }
-                    else {
-                      append(apps[rh].ratio_window,window_size,r_pred);
-                      append(tmp,window_size,apps[rh].interval_counter);
-                      memcpy(apps[rh].counter_window,tmp,window_size*sizeof(uint64_t));
-                    }
-                    
-                    int src_counter=0;
-                    for(int ic=0;ic<max_src;ic++){
-                      if(apps[rh].source_count[ic]>0)
-                        src_counter++;
-                    }
-                    // printf("  v_max = %" PRIu64 " v_min = %" PRIu64 " v_pred = %" PRIu64 " uinque_sIP = %d",apps[rh].max_counter,apps[rh].min_counter,v_pred,src_counter);
-                    // printf("  interval_counter = %" PRIu64 " new_session = %" PRIu16" ratio_pred = %f\n",apps[rh].interval_counter,apps[rh].new_session,r_pred);
-                  
-                    apps[rh].interval_counter = 0;
-                    apps[rh].new_session=0;
-                    free(tmp);
-                    }
-                number_of_packets_in_a_interval = 0;
-                c++;
-                //print source IP stats
-                if (c%window_size==0){
-                   // window size reached
-                  //  printf("=================\n");
-                    // printf("=================\n");
-                   /*
-                   for(uint16_t uu=0;uu<max_src;uu++){
-                        
-                      if(src_stats[uu].total_session>0)
-                          // system("clear");
-                          
-                          printf("%s , %u , %u , %u, %u\n",src_stats[uu].ip_string, src_stats[uu].packet_count, src_stats[uu].total_session, (src_stats[uu].total_session - src_stats[uu].idle_session),src_stats[uu].packet_volume); //uncomment
-                    }
-                    */
-                   c=0;
-                }
-                
-                
+  while(!force_quit) {        
+    start_time = clock();
+    end_time = clock();
+    number_of_packets_in_a_interval = 0;
+    
+    // Training phase - establish statistical baselines
+    if (training) {
+      printf("\rD3 Training phase: interval %d/%d", c+1, max_training_intervals);
+      fflush(stdout);
+      
+      start_time = clock();
+      end_time = clock();
+      // Collect packets for an Interval (one second)
+      while((((end_time - start_time) / interval_len) < 1) && (!force_quit)) {
+        // Receiving packets
+        for (i = 0; i < qconf->n_rx_port; i++) {
+          port = qconf->rx_port_list[i];
+          // printf("%d\n",port);
+          nb_rx = rte_eth_rx_burst(port, 0, pkts_burst, MAX_PKT_BURST);
+          // printf("%d\n",nb_rx);
+          if (unlikely(nb_rx == 0))
+            continue;
+          port_statistics[port].rx += nb_rx;
+          
+          // Processing packets
+          for (j = 0; j < nb_rx; j++) {
+            pkt = pkts_burst[j];
+            uint16_t packetLength = rte_pktmbuf_pkt_len(pkt);
+            uint16_t payloadLength = packetLength - pkt->l2_len - pkt->l3_len - pkt->l4_len;
+            uint32_t pkt_len = pkt->pkt_len;
+            char *data = rte_pktmbuf_mtod(pkt, char *);
+            int len = rte_pktmbuf_pkt_len(pkt);
+            struct pcap_pkthdr h;
+            h.len = h.caplen = len;
+            gettimeofday(&h.ts, NULL);
+            ndpi_process_packet(&ndpi_threads[lcore_id], &h, (const u_char *)data, pkt_len+payloadLength);
+          }
+          
+          // Sending packets back
+          nb_tx = rte_eth_tx_burst(port ^ 1, 0, pkts_burst, nb_rx);
+          if (unlikely(nb_tx < nb_rx)) {
+            uint16_t buf;
+            for (buf = nb_tx; buf < nb_rx; buf++)
+              rte_pktmbuf_free(pkts_burst[buf]);
+          }
+          number_of_packets_in_a_interval += nb_rx;
         }
-        return 0;
+        end_time = clock();
+      }
+  
+      // Process training data for each protocol
+      clearScreen();
+      
+      for(int i = 0; i < app_types; i++) {
+        if (apps[i].app_name == NULL || apps[i].total_packets == 0) continue;
+        
+        // Update training sample count
+        apps[i].training_samples++;
+        
+        // Establish baseline for this protocol
+        establish_baseline(&apps[i]);
+        
+        // Display training progress
+        // if (apps[i].training_samples % 10 == 0) {
+        //   printf("\nProtocol %s: Training sample %d\n", apps[i].app_name, apps[i].training_samples);
+        //   printf("  Baseline entropy (src): %.3f, threshold: %.3f\n", 
+        //          apps[i].baseline_entropy_src, apps[i].entropy_threshold);
+        //   printf("  Baseline traffic rate: %.2f, threshold: %.2f\n", 
+        //          apps[i].baseline_traffic_rate, apps[i].rate_threshold);
+        //   printf("  Current entropy (src): %.3f, (dst): %.3f, (size): %.3f\n",
+        //          apps[i].entropy_src_ip, apps[i].entropy_dst_port, apps[i].entropy_packet_size);
+        // }
+        
+        // Reset interval statistics
+        reset_interval_stats(&apps[i]);
+      }
+      
+      // Check if training should end
+
+      // Notice
+      
+      bool all_protocols_trained = true;
+      int protocols_with_baseline = 0;
+      
+      for(int i = 0; i < app_types; i++) {
+        if (apps[i].app_name != NULL && apps[i].training_samples > 0) {
+          if (apps[i].has_baseline) {
+            protocols_with_baseline++;
+          } else if (apps[i].training_samples < min_training_intervals) {
+            all_protocols_trained = false;
+          }
+        }
+      }
+      
+      
+      // End training if conditions are met
+      if ((protocols_with_baseline > 0 && all_protocols_trained) || c >= max_training_intervals - 1) {
+        training = false;
+        printf("\n\n=== D3 Training Phase Completed ===\n");
+        printf("Protocols with established baselines: %d\n", protocols_with_baseline);
+        
+        // Display final baseline statistics
+        for(int i = 0; i < app_types; i++) {
+          if (apps[i].app_name != NULL && apps[i].has_baseline) {
+            printf("\nProtocol: %s (samples: %d)\n", apps[i].app_name, apps[i].training_samples);
+            printf("  Baseline entropy - src: %.3f, dst: %.3f, size: %.3f\n",
+                   apps[i].baseline_entropy_src, apps[i].baseline_entropy_dst, apps[i].baseline_entropy_size);
+            printf("  Baseline traffic rate: %.2f packets/interval\n", apps[i].baseline_traffic_rate);
+            printf("  Detection thresholds - entropy: %.3f, rate: %.2f\n",
+                   apps[i].entropy_threshold, apps[i].rate_threshold);
+          }
+        }
+        printf("=== Starting D3 Detection Phase ===\n\n");
+        
+        // Save thresholds if requested
+        if (save_thresholds_after_training) {
+            printf("Saving thresholds to %s\n", threshold_file);
+            if (save_thresholds(threshold_file, apps, app_types)) {
+                printf("Thresholds saved successfully\n");
+            } else {
+                printf("Failed to save thresholds\n");
+            }
+        }
+        
+        c = 0;
+        start_time = clock();
+        end_time = clock();
+      } else {
+        ++c;
+      }
+      
+      number_of_packets_in_a_interval = 0;
+    }
+    
+    // Detection phase - D3 algorithm anomaly detection
+    if (!training) {
+      // Collect packets for one second
+      while(((end_time - start_time) / CLOCKS_PER_SEC) < 1 && (!force_quit)) {
+        // Receiving packets
+        for (i = 0; i < qconf->n_rx_port; i++) {
+          port = qconf->rx_port_list[i];
+          nb_rx = rte_eth_rx_burst(port, 0, pkts_burst, MAX_PKT_BURST);
+          if (unlikely(nb_rx == 0))
+            continue;
+          port_statistics[port].rx += nb_rx;
+          
+          // Processing packets
+          for (j = 0; j < nb_rx; j++) {
+            pkt = pkts_burst[j];
+            uint16_t packetLength = rte_pktmbuf_pkt_len(pkt);
+            uint16_t payloadLength = packetLength - pkt->l2_len - pkt->l3_len - pkt->l4_len;
+            uint32_t pkt_len = pkt->pkt_len;
+            char *data = rte_pktmbuf_mtod(pkt, char *);
+            int len = rte_pktmbuf_pkt_len(pkt);
+            struct pcap_pkthdr h;
+            h.len = h.caplen = len;
+            gettimeofday(&h.ts, NULL);
+            ndpi_process_packet(&ndpi_threads[lcore_id], &h, (const u_char *)data, pkt_len+payloadLength);
+          }
+          
+          // Sending packets back
+          nb_tx = rte_eth_tx_burst(port ^ 1, 0, pkts_burst, nb_rx);
+          if (unlikely(nb_tx < nb_rx)) {
+            uint16_t buf;
+            for (buf = nb_tx; buf < nb_rx; buf++)
+              rte_pktmbuf_free(pkts_burst[buf]);
+          }
+          number_of_packets_in_a_interval += nb_rx;
+        }
+        end_time = clock();
+      }
+      
+      // D3 Algorithm: Analyze traffic and detect DDoS attacks
+      clearScreen();
+      printf("D3 Detection phase: interval %d\n", c+1);
+      printf("=== Real-time Traffic Analysis ===\n");
+      
+      for(int i = 0; i < app_types; i++) {
+        if (apps[i].app_name == NULL || !apps[i].has_baseline) continue;
+        
+        // Skip if no traffic in this interval
+        if (apps[i].total_packets == 0) {
+          reset_interval_stats(&apps[i]);
+          continue;
+        }
+        
+        // D3 Algorithm: Perform DDoS detection
+        bool attack_detected = detect_ddos_attack(&apps[i]);
+        
+        if (attack_detected) {
+          printf("\n!!! D3 ALGORITHM: DDoS ATTACK DETECTED !!!\n");
+          printf("Protocol: %s\n", apps[i].app_name);
+          printf("=== Attack Characteristics ===\n");
+          printf("  Current entropy (src IP): %.3f (baseline: %.3f, threshold: %.3f)\n",
+                 apps[i].entropy_src_ip, apps[i].baseline_entropy_src, apps[i].entropy_threshold);
+          printf("  Current entropy (dst port): %.3f (baseline: %.3f)\n",
+                 apps[i].entropy_dst_port, apps[i].baseline_entropy_dst);
+          printf("  Current entropy (pkt size): %.3f (baseline: %.3f)\n",
+                 apps[i].entropy_packet_size, apps[i].baseline_entropy_size);
+          printf("  Current traffic rate: %.2f (baseline: %.2f, threshold: %.2f)\n",
+                 apps[i].traffic_rate, apps[i].baseline_traffic_rate, apps[i].rate_threshold);
+          printf("  Anomaly score: %.3f\n", apps[i].anomaly_score);
+          printf("  Unique source IPs: %d\n", apps[i].unique_src_ips);
+          printf("  Total packets: %d\n", apps[i].total_packets);
+          
+          // Determine attack type based on entropy patterns
+          if (apps[i].entropy_src_ip < apps[i].entropy_threshold && apps[i].traffic_rate > apps[i].rate_threshold) {
+            printf("  Attack type: High-volume attack from concentrated sources\n");
+          } else if (apps[i].anomaly_score > 0.7) {
+            printf("  Attack type: Statistical anomaly detected\n");
+          }
+          
+          printf("=== Initiating Mitigation ===\n");
+          
+          // Perform DBScan clustering for attack source analysis
+          perform_dbscan_clustering(i);
+          
+        } else {
+          // Normal traffic - display statistics periodically
+          if (c % 10 == 0) {
+            printf("\nProtocol: %s (Normal)\n", apps[i].app_name);
+            printf("  Entropy: src=%.3f, dst=%.3f, size=%.3f\n",
+                   apps[i].entropy_src_ip, apps[i].entropy_dst_port, apps[i].entropy_packet_size);
+            printf("  Traffic rate: %.2f, Anomaly score: %.3f\n",
+                   apps[i].traffic_rate, apps[i].anomaly_score);
+          }
+          
+          // Adaptive baseline update for normal traffic
+          if (apps[i].anomaly_score < 0.2) { // Very normal traffic
+            double alpha = 0.05; // Slow adaptation
+            apps[i].baseline_entropy_src = (1 - alpha) * apps[i].baseline_entropy_src + alpha * apps[i].entropy_src_ip;
+            apps[i].baseline_entropy_dst = (1 - alpha) * apps[i].baseline_entropy_dst + alpha * apps[i].entropy_dst_port;
+            apps[i].baseline_traffic_rate = (1 - alpha) * apps[i].baseline_traffic_rate + alpha * apps[i].traffic_rate;
+            
+            // Update thresholds
+            apps[i].entropy_threshold = apps[i].baseline_entropy_src * 0.7;
+            apps[i].rate_threshold = apps[i].baseline_traffic_rate * 2.0;
+          }
+        }
+        
+        // Reset interval statistics for next measurement
+        reset_interval_stats(&apps[i]);
+      }
+      
+      number_of_packets_in_a_interval = 0;
+      c++;
+      
+      // Reset counter periodically
+      if (c % 100 == 0) {
+        printf("\n=== D3 Algorithm Status ===\n");
+        printf("Detection intervals completed: %d\n", c);
+        printf("System running normally...\n\n");
+        c = 0;
+      }
+    }
+  }
+  
+  return 0;
 }
 
+static void print_usage(const char *prgname) {
+  printf("%s [EAL options] -- [application options]\n"
+         "Application options:\n"
+         "  -d, --detection-only: Skip training phase and load thresholds from file\n"
+         "  -s, --save-thresholds: Save thresholds after training phase\n"
+         "  -f, --threshold-file=FILE: Specify threshold file path (default: %s)\n"
+         "  -h, --help: Display this help message\n",
+         prgname, DEFAULT_THRESHOLD_FILE);
+}
+
+// Parse application-specific arguments
+static int parse_app_args(int argc, char **argv) {
+  int opt, option_index;
+  static struct option lgopts[] = {
+    {"detection-only", no_argument, NULL, 'd'},
+    {"save-thresholds", no_argument, NULL, 's'},
+    {"threshold-file", required_argument, NULL, 'f'},
+    {"help", no_argument, NULL, 'h'},
+    {NULL, 0, 0, 0}
+  };
+
+  while ((opt = getopt_long(argc, argv, "dsf:h", lgopts, &option_index)) != EOF) {
+    switch (opt) {
+      case 'd':
+        skip_training = true;
+        printf("Detection-only mode enabled\n");
+        break;
+      case 's':
+        save_thresholds_after_training = true;
+        printf("Saving thresholds after training\n");
+        break;
+      case 'f':
+        strncpy(threshold_file, optarg, sizeof(threshold_file) - 1);
+        threshold_file[sizeof(threshold_file) - 1] = '\0';
+        printf("Using threshold file: %s\n", threshold_file);
+        break;
+      case 'h':
+        print_usage(argv[0]);
+        return -1;
+      default:
+        printf("Invalid option: %c\n", opt);
+        print_usage(argv[0]);
+        return -1;
+    }
+  }
+  
+  return 0;
+}
 
 
 static void signal_handler(int signum)
@@ -1251,6 +1920,13 @@ int main(int argc, char *argv[]){
   argc -= ret;
   argv += ret;
   
+  // Parse application arguments
+  ret = parse_app_args(argc, argv);
+  if (ret < 0)
+    rte_exit(EXIT_FAILURE, "Invalid application arguments\n");
+  
+
+
   force_quit = false;
   signal(SIGINT, signal_handler);
   signal(SIGINT, signal_handler);
@@ -1342,12 +2018,12 @@ int main(int argc, char *argv[]){
 		printf(" Done\n");
   }
 
-  for(unsigned int li=0;li<RTE_MAX_LCORE;li++){
-    qconf = &lcore_queue_conf[li];
-    if (qconf->n_rx_port != 0) {
-      printf("current active flows for %u : %llu  , total flows: %llu\n",li,ndpi_threads[li].workflow->cur_active_flows, ndpi_threads[li].workflow->total_active_flows);
-    }
-  }
+  // for(unsigned int li=0;li<RTE_MAX_LCORE;li++){
+  //   qconf = &lcore_queue_conf[li];
+  //   if (qconf->n_rx_port != 0) {
+  //     printf("current active flows for %u : %llu  , total flows: %llu\n",li,ndpi_threads[li].workflow->cur_active_flows, ndpi_threads[li].workflow->total_active_flows);
+  //   }
+  // }
 
   // Clean-up EAL
   rte_eal_cleanup();

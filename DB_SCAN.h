@@ -68,7 +68,9 @@ void dbscan_add_point(dbscan_points_t* points, uint32_t ip, const char* ip_str, 
     points->points[points->num_points].ip = ip;
     strncpy(points->points[points->num_points].ip_str, ip_str, INET_ADDRSTRLEN);
     points->points[points->num_points].cluster_id = UNCLASSIFIED;
+    // NOTICE
     points->points[points->num_points].packet_count = packet_count;
+    // NOTICE
     points->points[points->num_points].packet_volume = packet_volume;
     points->num_points++;
 }
@@ -141,6 +143,7 @@ bool dbscan_expand_cluster(dbscan_points_t* points, int point_idx, int cluster_i
     }
 
     // Mark as part of the cluster
+    // Notice
     points->points[point_idx].cluster_id = cluster_id;
 
     // Process all neighbors
